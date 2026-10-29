@@ -11,6 +11,8 @@ services:
         value: 0.0.0.0
       - key: HORIZON_REQUIRE_AUTH
         value: "true"
+      - key: HORIZON_ENABLE_HSTS
+        value: "true"
       - key: HORIZON_BASIC_AUTH_USER
         sync: false
       - key: HORIZON_BASIC_AUTH_PASSWORD

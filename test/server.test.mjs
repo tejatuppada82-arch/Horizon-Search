@@ -7,6 +7,7 @@ import { createServer } from "../src/server.mjs";
 test("keeps the example credential blank", async () => {
   const example = await readFile(new URL("../.env.example", import.meta.url), "utf8");
   assert.match(example, /^BRAVE_SEARCH_API_KEY=\r?$/m);
+  assert.match(example, /^HORIZON_ENABLE_HSTS=false\r?$/m);
   assert.match(example, /^HORIZON_BASIC_AUTH_USER=\r?$/m);
   assert.match(example, /^HORIZON_BASIC_AUTH_PASSWORD=\r?$/m);
 });
@@ -100,6 +101,21 @@ test("fails closed when required authentication credentials are incomplete", () 
     () => createServer({ authUser: "owner:name", authPassword: "test-password" }),
     /must not contain a colon/,
   );
+});
+
+test("enables HSTS only when configured for an HTTPS deployment", async () => {
+  await withServer({ enableHsts: true }, async (origin) => {
+    const response = await fetch(origin);
+    assert.equal(
+      response.headers.get("strict-transport-security"),
+      "max-age=31536000",
+    );
+  });
+
+  await withServer({ enableHsts: false }, async (origin) => {
+    const response = await fetch(origin);
+    assert.equal(response.headers.get("strict-transport-security"), null);
+  });
 });
 
 test("serves the search page without making provider requests", async () => {

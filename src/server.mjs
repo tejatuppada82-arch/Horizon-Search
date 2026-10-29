@@ -206,6 +206,7 @@ export function createServer({
   apiKey = process.env.BRAVE_SEARCH_API_KEY,
   allowedOrigin: configuredOrigin = process.env.HORIZON_ALLOWED_ORIGIN,
   requireAuth = parseBoolean(process.env.HORIZON_REQUIRE_AUTH, "HORIZON_REQUIRE_AUTH"),
+  enableHsts = parseBoolean(process.env.HORIZON_ENABLE_HSTS, "HORIZON_ENABLE_HSTS"),
   authUser = process.env.HORIZON_BASIC_AUTH_USER,
   authPassword = process.env.HORIZON_BASIC_AUTH_PASSWORD,
   fetchImpl = fetch,
@@ -226,6 +227,9 @@ export function createServer({
   const allowSearch = makeRateLimiter(rateLimit, now);
 
   return createHttpServer(async (request, response) => {
+    if (enableHsts) {
+      response.setHeader("Strict-Transport-Security", "max-age=31536000");
+    }
     try {
       const url = new URL(request.url, "http://localhost");
       if (request.method === "GET" && url.pathname === "/healthz") {

@@ -76,6 +76,12 @@
   returned HTTP 401, consistent with the configured Basic Auth protection.
 - Updated the GitHub README with the published URL, private-access note,
   Free-plan wake-up behavior, and custom browser search URL template.
+- Reviewed the reported IDOR, SQL injection, query validation, authentication,
+  secret storage, XSS, dependency, and transport-security concerns against the
+  project. No IDOR or SQL/database surface exists; the relevant query,
+  authentication, secret, and output-safety controls are already implemented.
+- Enabled configurable HSTS for Render's HTTPS deployment and added tests;
+  HSTS remains disabled by default for local HTTP development.
 
 ## Waiting on the project owner
 

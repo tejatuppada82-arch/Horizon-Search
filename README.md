@@ -60,8 +60,8 @@ The Render Blueprint (`render.yaml`) binds to `0.0.0.0` and requires
 application-wide HTTP Basic authentication before serving pages or search
 requests. Set the username, password, and Brave key as secret environment
 variables in Render; never commit their values. Render terminates HTTPS for
-the public service. The health check at `/healthz` intentionally does not
-require credentials.
+the public service and enables HSTS for the deployed HTTPS origin. The health
+check at `/healthz` intentionally does not require credentials.
 
 The Render deployment is intended for private, owner-only use. Basic Auth and
 same-origin checks are not a public user-account system or a substitute for
