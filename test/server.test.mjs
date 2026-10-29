@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { request as httpRequest } from "node:http";
 import { readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { createServer } from "../src/server.mjs";
 
@@ -10,6 +12,170 @@ test("keeps the example credential blank", async () => {
   assert.match(example, /^HORIZON_ENABLE_HSTS=false\r?$/m);
   assert.match(example, /^HORIZON_BASIC_AUTH_USER=\r?$/m);
   assert.match(example, /^HORIZON_BASIC_AUTH_PASSWORD=\r?$/m);
+});
+
+test("rejects malformed search objects and control characters before calling the provider", async () => {
+  let providerCalls = 0;
+  await withServer({
+    apiKey: "test-token",
+    fetchImpl: async () => {
+      providerCalls += 1;
+      return Response.json({ web: { results: [] } });
+    },
+  }, async (origin) => {
+    for (const body of [
+      null, [], "test", { query: 123 }, { query: {} },
+      { query: "test", id: "someone-else" },
+      { query: "test", name: "'; DROP TABLE users;--" },
+      { query: "test", __proto__: null, constructor: {} },
+      { query: "x".repeat(401) }, { query: `${" ".repeat(401)}test` },
+      { query: "test\u0000query" }, { query: "test\u001bquery" },
+    ]) {
+      const response = await fetch(`${origin}/api/search`, {
+        method: "POST", headers: searchHeaders(origin), body: JSON.stringify(body),
+      });
+      assert.equal(response.status, 400, JSON.stringify(body));
+    }
+    const malformed = await fetch(`${origin}/api/search`, {
+      method: "POST", headers: searchHeaders(origin), body: "{not json}",
+    });
+    assert.equal(malformed.status, 400);
+    assert.equal(providerCalls, 0);
+  });
+});
+
+test("enforces body size limits even without a content length", async () => {
+  let providerCalls = 0;
+  await withServer({
+    apiKey: "test-token",
+    fetchImpl: async () => { providerCalls += 1; return Response.json({ web: { results: [] } }); },
+  }, async (origin) => {
+    const body = JSON.stringify({ query: "x".repeat(5000) });
+    const headers = searchHeaders(origin);
+    assert.equal(await sendRawRequest(`${origin}/api/search`, {
+      headers: { ...headers, "Content-Length": Buffer.byteLength(body) }, body,
+    }), 413);
+    assert.equal(await sendRawRequest(`${origin}/api/search`, {
+      headers: { ...headers, "Transfer-Encoding": "chunked" }, body,
+    }), 413);
+    assert.equal(providerCalls, 0);
+  });
+});
+
+test("throttles failed authentication, ignores spoofed forwarding headers, and recovers", async () => {
+  let currentTime = 1000;
+  await withServer({
+    requireAuth: true, authUser: "owner", authPassword: "test-password",
+    authAttemptLimit: 2, now: () => currentTime,
+  }, async (origin) => {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await fetch(origin, {
+        headers: { "X-Forwarded-For": `192.0.2.${attempt}` },
+      });
+      assert.equal(response.status, 401);
+    }
+    const blocked = await fetch(origin, { headers: { "X-Forwarded-For": "192.0.2.99" } });
+    assert.equal(blocked.status, 429);
+    assert.equal(blocked.headers.get("retry-after"), "60");
+    const health = await fetch(`${origin}/healthz`);
+    assert.equal(health.status, 200);
+    // Do not check any further guesses while the failure bucket is exhausted.
+    const authorization = `Basic ${Buffer.from("owner:test-password").toString("base64")}`;
+    assert.equal((await fetch(origin, { headers: { Authorization: authorization } })).status, 429);
+    currentTime += 60_000;
+    assert.equal((await fetch(origin, { headers: { Authorization: authorization } })).status, 200);
+    assert.equal((await fetch(origin)).status, 401);
+  });
+});
+
+test("caps total provider requests independently of the per-client limit", async () => {
+  let currentTime = 1000;
+  let providerCalls = 0;
+  await withServer({
+    apiKey: "test-token", globalRateLimit: 1, rateLimit: 100,
+    now: () => currentTime,
+    fetchImpl: async () => { providerCalls += 1; return Response.json({ web: { results: [] } }); },
+  }, async (origin) => {
+    const submit = () => fetch(`${origin}/api/search`, {
+      method: "POST", headers: searchHeaders(origin), body: JSON.stringify({ query: "test" }),
+    });
+    assert.equal((await submit()).status, 200);
+    const blocked = await submit();
+    assert.equal(blocked.status, 429);
+    assert.equal(blocked.headers.get("retry-after"), "60");
+    assert.equal(providerCalls, 1);
+    currentTime += 60_000;
+    assert.equal((await submit()).status, 200);
+    assert.equal(providerCalls, 2);
+  });
+});
+
+test("bounds concurrent provider work and releases slots after a failure", async () => {
+  let release;
+  let started;
+  let providerCalls = 0;
+  const providerStarted = new Promise((resolve) => { started = resolve; });
+  await withServer({
+    apiKey: "test-token", maxConcurrentSearches: 1,
+    fetchImpl: async () => {
+      providerCalls += 1;
+      if (providerCalls === 1) {
+        started();
+        await new Promise((resolve) => { release = resolve; });
+        throw new Error("private provider failure");
+      }
+      return Response.json({ web: { results: [] } });
+    },
+  }, async (origin) => {
+    const submit = () => fetch(`${origin}/api/search`, {
+      method: "POST", headers: searchHeaders(origin), body: JSON.stringify({ query: "test" }),
+    });
+    const pending = submit();
+    await providerStarted;
+    try {
+      const busy = await submit();
+      assert.equal(busy.status, 503);
+      assert.equal(providerCalls, 1);
+    } finally {
+      release();
+    }
+    assert.equal((await pending).status, 502);
+    assert.equal((await submit()).status, 200);
+    assert.equal(providerCalls, 2);
+  });
+});
+
+test("requires authentication by default in production and rejects unsafe limits", () => {
+  const previous = process.env.NODE_ENV;
+  process.env.NODE_ENV = "production";
+  try {
+    assert.throws(() => createServer(), /credentials are not configured/);
+    assert.throws(() => createServer({ requireAuth: false }), /authentication/);
+  } finally {
+    if (previous === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previous;
+  }
+  for (const key of ["rateLimit", "globalRateLimit", "authAttemptLimit", "maxConcurrentSearches"]) {
+    for (const value of [0, -1, 1.5, Infinity, "20"]) {
+      assert.throws(() => createServer({ [key]: value }), /positive integer/);
+    }
+  }
+});
+
+test("refuses to start an unauthenticated listener beyond loopback", () => {
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL("../src/server.mjs", import.meta.url))], {
+    env: {
+      ...process.env, NODE_ENV: "test", HORIZON_HOST: "0.0.0.0", PORT: "3000",
+      HORIZON_REQUIRE_AUTH: "false", HORIZON_ENABLE_HSTS: "false",
+      HORIZON_BASIC_AUTH_USER: "", HORIZON_BASIC_AUTH_PASSWORD: "", BRAVE_SEARCH_API_KEY: "",
+      HORIZON_ALLOWED_ORIGIN: "", HORIZON_SEARCH_RATE_LIMIT: "20",
+      HORIZON_GLOBAL_RATE_LIMIT: "60", HORIZON_AUTH_ATTEMPT_LIMIT: "10",
+      HORIZON_MAX_CONCURRENT_SEARCHES: "4",
+    },
+    encoding: "utf8", timeout: 3000,
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Binding beyond loopback requires authentication credentials/);
 });
 
 async function withServer(options, run) {
@@ -101,6 +267,45 @@ test("fails closed when required authentication credentials are incomplete", () 
     () => createServer({ authUser: "owner:name", authPassword: "test-password" }),
     /must not contain a colon/,
   );
+});
+
+test("rejects malformed and incorrect credentials on static and API routes", async () => {
+  let providerCalls = 0;
+  await withServer({
+    requireAuth: true, authUser: "owner", authPassword: "test-password", apiKey: "secret-sentinel",
+    fetchImpl: async () => { providerCalls += 1; throw new Error("secret-sentinel"); },
+  }, async (origin) => {
+    for (const authorization of [
+      "Bearer test-password", "Basic !!!", "Basic b3duZXI=",
+      `Basic ${Buffer.from("owner:wrong-password").toString("base64")}`,
+    ]) {
+      const asset = await fetch(`${origin}/results.js`, { headers: { Authorization: authorization } });
+      assert.equal(asset.status, 401);
+      assert.doesNotMatch(await asset.text(), /secret-sentinel/);
+      const api = await fetch(`${origin}/api/search`, {
+        method: "POST", headers: searchHeaders(origin, authorization),
+        body: JSON.stringify({ query: "test", id: "another-owner" }),
+      });
+      assert.equal(api.status, 401);
+    }
+    assert.equal(providerCalls, 0);
+  });
+});
+
+test("applies security headers and never serves alternate secret files", async () => {
+  await withServer({ enableHsts: true }, async (origin) => {
+    for (const path of ["/", "/results.js", "/healthz", "/.env.production", "/.env.local", "/.git/config"]) {
+      const response = await fetch(`${origin}${path}`);
+      assert.equal(response.status, path.startsWith("/.") ? 404 : 200);
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+      assert.match(response.headers.get("content-security-policy"), /script-src 'self'/);
+      assert.match(response.headers.get("content-security-policy"), /frame-ancestors 'none'/);
+      assert.equal(response.headers.get("referrer-policy"), "no-referrer");
+      assert.equal(response.headers.get("permissions-policy"), "camera=(), microphone=(), geolocation=()");
+      await response.text();
+    }
+  });
 });
 
 test("enables HSTS only when configured for an HTTPS deployment", async () => {

@@ -88,6 +88,41 @@ proxy, configure `HORIZON_ALLOWED_ORIGIN` to that exact HTTPS origin.
 Run `npm test` for provider and server tests. Tests use mocked provider
 responses and do not call Brave.
 
+### Security hardening and limits
+
+`NODE_ENV=production` requires configured Basic Auth credentials even if
+`HORIZON_REQUIRE_AUTH` is unset or false. Starting the executable server on a
+non-loopback address also requires credentials. Local loopback development
+continues to work without credentials. Keep externally reachable instances
+behind an HTTPS-terminating proxy; the app itself serves HTTP to that proxy.
+
+The following positive-integer environment settings bound abuse and provider
+work. The Render Blueprint sets these defaults explicitly:
+
+| Setting | Default | Scope |
+|---|---|---|
+| `HORIZON_SEARCH_RATE_LIMIT` | 20 | Search attempts per socket IP per minute |
+| `HORIZON_GLOBAL_RATE_LIMIT` | 60 | Total admitted search attempts per process per minute |
+| `HORIZON_AUTH_ATTEMPT_LIMIT` | 10 | Failed sign-ins per socket IP per minute |
+| `HORIZON_MAX_CONCURRENT_SEARCHES` | 4 | Active provider calls per process |
+
+Excess attempts receive 429 with `Retry-After`; a full concurrency pool returns
+503. An exhausted failed-sign-in bucket blocks further credential checks for
+the remainder of its one-minute window, including valid credentials. This
+prevents continued password guessing through throttled responses; legitimate
+users sharing that socket IP may need to wait for the window to expire.
+Forwarded IP headers are intentionally not trusted: behind a reverse proxy,
+clients may share a socket-IP bucket. An edge WAF can add IP-aware protection
+using the hosting provider's trusted network information.
+
+Limits are in memory and reset on restart. They are **not** a durable monthly
+spending cap or a distributed limit across replicas. Before scaling or public
+use, add shared rate/budget controls, provider-side spending alerts and edge
+protection. Tune limits against the actual Brave plan.
+
+See [SECURITY.md](./SECURITY.md) for the verified finding disposition,
+regression coverage, secret handling, and operational follow-up.
+
 ## Current milestone
 
 See [PROJECT-STATUS.md](./PROJECT-STATUS.md) for what is implemented and what

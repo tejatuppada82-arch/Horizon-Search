@@ -19,6 +19,19 @@ export class SearchError extends Error {
   }
 }
 
+export function normalizeQuery(value) {
+  // Validate before normalization so excessive whitespace cannot bypass the limit.
+  if (
+    typeof value !== "string" || value.length > 400 ||
+    /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)
+  ) {
+    throw new SearchError("Enter a query between 1 and 400 characters without control characters.", 400);
+  }
+  const query = value.trim().replace(/\s+/g, " ");
+  if (!query) throw new SearchError("Enter a query between 1 and 400 characters.", 400);
+  return query;
+}
+
 function safeResultUrl(value) {
   if (typeof value !== "string" || value.length > 2048) return null;
 
@@ -77,6 +90,7 @@ function normalizeResults(payload, page, type) {
 async function readJsonBounded(response) {
   const contentLength = Number(response.headers.get("content-length"));
   if (Number.isFinite(contentLength) && contentLength > MAX_RESPONSE_BYTES) {
+    await response.body?.cancel();
     throw new SearchError("Brave returned an oversized response.", 502);
   }
 
@@ -111,6 +125,7 @@ async function readJsonBounded(response) {
 }
 
 export async function searchBrave(query, apiKey, fetchImpl = fetch, page = 1, type = "all") {
+  query = normalizeQuery(query);
   if (!SEARCH_TYPES.includes(type)) {
     throw new SearchError("Choose a supported search category.", 400);
   }
@@ -130,6 +145,8 @@ export async function searchBrave(query, apiKey, fetchImpl = fetch, page = 1, ty
   let response;
   try {
     response = await fetchImpl(url, {
+      // Never forward the provider token to a redirected destination.
+      redirect: "error",
       headers: {
         Accept: "application/json",
         "X-Subscription-Token": apiKey,

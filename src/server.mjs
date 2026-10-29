@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import {
   MAX_IMAGE_PAGES,
   MAX_SEARCH_PAGES,
+  normalizeQuery,
   SEARCH_TYPES,
   searchBrave,
   SearchError,
@@ -13,6 +14,7 @@ import {
 const ROOT = new URL("../", import.meta.url);
 const MAX_REQUEST_BYTES = 4096;
 const RATE_WINDOW_MS = 60_000;
+const MAX_RATE_CLIENTS = 10_000;
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 class HttpError extends Error {
@@ -31,6 +33,7 @@ function send(response, status, contentType, body) {
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
   });
   response.end(body);
 }
@@ -44,6 +47,14 @@ function parseBoolean(value, name) {
   if (value === "true") return true;
   if (value === "false") return false;
   throw new Error(`${name} must be "true" or "false".`);
+}
+
+function parseLimit(value, fallback, name) {
+  if (value === undefined || value === "") return fallback;
+  if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  return Number(value);
 }
 
 function credentialsMatch(request, username, password) {
@@ -71,8 +82,17 @@ function credentialsMatch(request, username, password) {
     timingSafeEqual(suppliedPassword, expectedPassword);
 }
 
-function requireAuthentication(request, response, username, password) {
+function requireAuthentication(request, response, username, password, allowFailure) {
+  const client = request.socket.remoteAddress || "unknown";
+  // Check the failure bucket before comparing credentials. Otherwise an attacker
+  // can keep testing guesses while receiving 429 and detect a correct guess.
+  if (!allowFailure(client, false)) {
+    response.setHeader("Retry-After", "60");
+    sendJson(response, 429, { error: "Too many failed sign-ins. Please wait a minute." });
+    return false;
+  }
   if (credentialsMatch(request, username, password)) return true;
+  allowFailure(client);
   response.setHeader("WWW-Authenticate", 'Basic realm="Horizon Search", charset="UTF-8"');
   sendJson(response, 401, { error: "Authentication required." });
   return false;
@@ -159,10 +179,13 @@ function normalizeAllowedOrigin(value) {
 }
 
 function makeRateLimiter(limit, now) {
+  if (!Number.isSafeInteger(limit) || limit < 1) {
+    throw new Error("Rate limits must be a positive integer.");
+  }
   const clients = new Map();
   let lastPrunedAt = 0;
 
-  return (key) => {
+  return (key, consume = true) => {
     const currentTime = now();
     if (currentTime - lastPrunedAt >= RATE_WINDOW_MS) {
       for (const [client, record] of clients) {
@@ -173,12 +196,14 @@ function makeRateLimiter(limit, now) {
 
     let client = clients.get(key);
     if (!client || currentTime - client.startedAt >= RATE_WINDOW_MS) {
+      // Fail closed rather than growing memory without bound on many distinct clients.
+      if (!client && clients.size >= MAX_RATE_CLIENTS) return false;
       client = { startedAt: currentTime, count: 0 };
       clients.set(key, client);
     }
 
     if (client.count >= limit) return false;
-    client.count += 1;
+    if (consume) client.count += 1;
     return true;
   };
 }
@@ -205,13 +230,17 @@ async function serveStatic(pathname, response) {
 export function createServer({
   apiKey = process.env.BRAVE_SEARCH_API_KEY,
   allowedOrigin: configuredOrigin = process.env.HORIZON_ALLOWED_ORIGIN,
-  requireAuth = parseBoolean(process.env.HORIZON_REQUIRE_AUTH, "HORIZON_REQUIRE_AUTH"),
+  requireAuth = process.env.NODE_ENV === "production" ||
+    parseBoolean(process.env.HORIZON_REQUIRE_AUTH, "HORIZON_REQUIRE_AUTH"),
   enableHsts = parseBoolean(process.env.HORIZON_ENABLE_HSTS, "HORIZON_ENABLE_HSTS"),
   authUser = process.env.HORIZON_BASIC_AUTH_USER,
   authPassword = process.env.HORIZON_BASIC_AUTH_PASSWORD,
   fetchImpl = fetch,
   now = Date.now,
-  rateLimit = 20,
+  rateLimit = parseLimit(process.env.HORIZON_SEARCH_RATE_LIMIT, 20, "HORIZON_SEARCH_RATE_LIMIT"),
+  globalRateLimit = parseLimit(process.env.HORIZON_GLOBAL_RATE_LIMIT, 60, "HORIZON_GLOBAL_RATE_LIMIT"),
+  authAttemptLimit = parseLimit(process.env.HORIZON_AUTH_ATTEMPT_LIMIT, 10, "HORIZON_AUTH_ATTEMPT_LIMIT"),
+  maxConcurrentSearches = parseLimit(process.env.HORIZON_MAX_CONCURRENT_SEARCHES, 4, "HORIZON_MAX_CONCURRENT_SEARCHES"),
 } = {}) {
   const allowedOrigin = normalizeAllowedOrigin(configuredOrigin);
   const authEnabled = Boolean(authUser || authPassword);
@@ -221,12 +250,21 @@ export function createServer({
   if (requireAuth && !authEnabled) {
     throw new Error("Basic authentication is required but its credentials are not configured.");
   }
+  if (process.env.NODE_ENV === "production" && !authEnabled) {
+    throw new Error("Production requires authentication.");
+  }
   if (authUser?.includes(":")) {
     throw new Error("HORIZON_BASIC_AUTH_USER must not contain a colon.");
   }
   const allowSearch = makeRateLimiter(rateLimit, now);
+  const allowGlobalSearch = makeRateLimiter(globalRateLimit, now);
+  const allowAuthFailure = makeRateLimiter(authAttemptLimit, now);
+  if (!Number.isSafeInteger(maxConcurrentSearches) || maxConcurrentSearches < 1) {
+    throw new Error("maxConcurrentSearches must be a positive integer.");
+  }
+  let activeSearches = 0;
 
-  return createHttpServer(async (request, response) => {
+  const server = createHttpServer(async (request, response) => {
     if (enableHsts) {
       response.setHeader("Strict-Transport-Security", "max-age=31536000");
     }
@@ -238,7 +276,7 @@ export function createServer({
       }
       if (
         authEnabled &&
-        !requireAuthentication(request, response, authUser, authPassword)
+        !requireAuthentication(request, response, authUser, authPassword, allowAuthFailure)
       ) {
         return;
       }
@@ -257,12 +295,13 @@ export function createServer({
 
       validateSearchRequest(request, allowedOrigin);
       const body = await readRequestBody(request);
-      const query = typeof body?.query === "string"
-        ? body.query.trim().replace(/\s+/g, " ")
-        : "";
-      if (!query || query.length > 400) {
-        throw new HttpError("Enter a query between 1 and 400 characters.", 400);
+      if (
+        !body || typeof body !== "object" || Array.isArray(body) ||
+        Object.keys(body).some((key) => !["query", "page", "type"].includes(key))
+      ) {
+        throw new HttpError("Send an object containing only query, page, and type.", 400);
       }
+      const query = normalizeQuery(body.query);
       const page = body?.page === undefined ? 1 : body.page;
       const type = body?.type === undefined ? "all" : body.type;
       const maxPages = type === "images" ? MAX_IMAGE_PAGES : MAX_SEARCH_PAGES;
@@ -277,12 +316,22 @@ export function createServer({
       }
 
       const client = request.socket.remoteAddress || "unknown";
-      if (!allowSearch(client)) {
+      if (!allowSearch(client) || !allowGlobalSearch("all")) {
+        response.setHeader("Retry-After", "60");
         throw new HttpError("Too many searches. Please wait a minute and try again.", 429);
       }
 
-      const { results, hasNext } = await searchBrave(query, apiKey, fetchImpl, page, type);
-      sendJson(response, 200, { results, provider: "Brave Search", page, type, hasNext });
+      if (activeSearches >= maxConcurrentSearches) {
+        response.setHeader("Retry-After", "1");
+        throw new HttpError("The search service is busy. Please try again shortly.", 503);
+      }
+      activeSearches += 1;
+      try {
+        const { results, hasNext } = await searchBrave(query, apiKey, fetchImpl, page, type);
+        sendJson(response, 200, { results, provider: "Brave Search", page, type, hasNext });
+      } finally {
+        activeSearches -= 1;
+      }
     } catch (error) {
       const status = error instanceof HttpError || error instanceof SearchError
         ? error.status
@@ -295,13 +344,19 @@ export function createServer({
       else response.destroy();
     }
   });
+  server.requestTimeout = 10_000;
+  server.headersTimeout = 10_000;
+  server.maxHeadersCount = 50;
+  return server;
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const server = createServer();
-  server.requestTimeout = 10_000;
-  server.headersTimeout = 10_000;
   const host = process.env.HORIZON_HOST || "127.0.0.1";
+  if (!LOOPBACK_HOSTS.has(host) && host !== "::1" &&
+      (!process.env.HORIZON_BASIC_AUTH_USER || !process.env.HORIZON_BASIC_AUTH_PASSWORD)) {
+    throw new Error("Binding beyond loopback requires authentication credentials.");
+  }
   const port = Number(process.env.PORT ?? 3000);
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new Error("PORT must be an integer between 1 and 65535.");

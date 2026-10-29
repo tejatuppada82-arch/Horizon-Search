@@ -9,10 +9,20 @@ services:
     envVars:
       - key: HORIZON_HOST
         value: 0.0.0.0
+      - key: NODE_ENV
+        value: production
       - key: HORIZON_REQUIRE_AUTH
         value: "true"
       - key: HORIZON_ENABLE_HSTS
         value: "true"
+      - key: HORIZON_SEARCH_RATE_LIMIT
+        value: "20"
+      - key: HORIZON_GLOBAL_RATE_LIMIT
+        value: "60"
+      - key: HORIZON_AUTH_ATTEMPT_LIMIT
+        value: "10"
+      - key: HORIZON_MAX_CONCURRENT_SEARCHES
+        value: "4"
       - key: HORIZON_BASIC_AUTH_USER
         sync: false
       - key: HORIZON_BASIC_AUTH_PASSWORD

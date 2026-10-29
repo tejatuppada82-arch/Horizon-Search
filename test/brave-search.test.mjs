@@ -186,3 +186,31 @@ test("fails closed on a malformed provider response", async () => {
     { status: 502, message: "Brave returned an invalid response." },
   );
 });
+
+test("validates queries at the provider boundary without stripping legitimate search syntax", async () => {
+  let providerCalls = 0;
+  const fetchImpl = async (url, options) => {
+    providerCalls += 1;
+    assert.equal(url.searchParams.get("q"), `' OR 1=1;-- <script>alert(1)</script> site:example.com`);
+    assert.equal(options.redirect, "error");
+    return Response.json({ web: { results: [] } });
+  };
+  for (const query of [null, {}, [], 1, "", " ", "x".repeat(401), "x\u0000y"]) {
+    await assert.rejects(searchBrave(query, "test-token", fetchImpl), { status: 400 });
+  }
+  assert.equal(providerCalls, 0);
+  await searchBrave(`' OR 1=1;-- <script>alert(1)</script> site:example.com`, "test-token", fetchImpl);
+  assert.equal(providerCalls, 1);
+});
+
+test("rejects oversized declared and streamed provider bodies", async () => {
+  for (const response of [
+    new Response("{}", { headers: { "Content-Length": "1000001" } }),
+    new Response("x".repeat(1_000_001)),
+  ]) {
+    await assert.rejects(searchBrave("test", "test-token", async () => response), {
+      status: 502, message: "Brave returned an oversized response.",
+    });
+    assert.equal(response.body.locked, false);
+  }
+});

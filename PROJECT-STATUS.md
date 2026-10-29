@@ -82,6 +82,19 @@
   authentication, secret, and output-safety controls are already implemented.
 - Enabled configurable HSTS for Render's HTTPS deployment and added tests;
   HSTS remains disabled by default for local HTTP development.
+- Hardened search JSON schema and shared query validation, including raw query
+  length and control-character checks; undeclared `id`/`name` fields are rejected.
+- Added failed-login throttling before credential checks, global-per-process
+  search admission, bounded limiter storage, and concurrent-provider limits.
+- Required credentials for production mode and external-address startup;
+  expanded ignored environment variants and explicitly enabled production in
+  the Render Blueprint. Added Permissions-Policy and disabled provider redirects.
+- Added `SECURITY.md` with the finding-by-finding disposition, scope, verified
+  controls, and remaining deployment responsibilities. No database or ID-based
+  object endpoint was found; no ORM or multi-user login framework was added.
+- All 40 mocked automated tests pass after security hardening, including
+  malicious result rendering, access checks, input limits, throttling/recovery,
+  provider quotas/concurrency, and unauthenticated external-listener rejection.
 
 ## Waiting on the project owner
 
