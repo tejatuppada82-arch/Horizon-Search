@@ -29,11 +29,16 @@ function send(response, status, contentType, body) {
     "Content-Type": contentType,
     "Cache-Control": "no-store",
     "Content-Security-Policy":
-      "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: https://imgs.search.brave.com",
+      "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' https://imgs.search.brave.com",
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Origin-Agent-Cluster": "?1",
+    "X-DNS-Prefetch-Control": "off",
+    "X-Permitted-Cross-Domain-Policies": "none",
   });
   response.end(body);
 }
@@ -256,6 +261,13 @@ export function createServer({
   if (authUser?.includes(":")) {
     throw new Error("HORIZON_BASIC_AUTH_USER must not contain a colon.");
   }
+  for (const [name, value] of [["HORIZON_BASIC_AUTH_USER", authUser], ["HORIZON_BASIC_AUTH_PASSWORD", authPassword]]) {
+    if (value !== undefined &&
+      (value.length > 256 || /[\u0000-\u001f\u007f]/.test(value))) {
+      throw new Error(`${name} must be at most 256 characters without control characters.`);
+    }
+  }
+  const hstsEnabled = process.env.NODE_ENV === "production" || enableHsts;
   const allowSearch = makeRateLimiter(rateLimit, now);
   const allowGlobalSearch = makeRateLimiter(globalRateLimit, now);
   const allowAuthFailure = makeRateLimiter(authAttemptLimit, now);
@@ -265,8 +277,8 @@ export function createServer({
   let activeSearches = 0;
 
   const server = createHttpServer(async (request, response) => {
-    if (enableHsts) {
-      response.setHeader("Strict-Transport-Security", "max-age=31536000");
+    if (hstsEnabled) {
+      response.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
     }
     try {
       const url = new URL(request.url, "http://localhost");

@@ -1,6 +1,6 @@
 # Horizon Search — Project status
 
-**Last updated:** 2026-10-29
+**Last updated:** 2026-10-30
 **Current phase:** Published on Render as a private, Basic Auth-protected service
 
 ## Done
@@ -95,6 +95,16 @@
 - All 40 mocked automated tests pass after security hardening, including
   malicious result rendering, access checks, input limits, throttling/recovery,
   provider quotas/concurrency, and unauthenticated external-listener rejection.
+- Completed an adversarial local audit of source, browser assets, deployment
+  configuration, tracked files, and Git history. No database/SQL, IDOR object
+  endpoint, active secret, SVG script, or production HTML injection surface was
+  found.
+- Added a committed npm lockfile and changed Render builds to `npm ci
+  --ignore-scripts`; added strict same-origin/cross-origin response headers,
+  removed unnecessary `data:` images from CSP, forced production HSTS with
+  `includeSubDomains`, and bounded authentication credential values.
+- `npm ci`, `npm audit --audit-level=moderate`, syntax checks, diff checks, and
+  all 41 local security/functional tests pass.
 
 ## Waiting on the project owner
 

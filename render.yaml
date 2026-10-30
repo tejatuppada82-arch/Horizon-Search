@@ -3,7 +3,7 @@ services:
     name: horizon-search
     runtime: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm ci --ignore-scripts
     startCommand: npm start
     healthCheckPath: /healthz
     envVars:

@@ -301,8 +301,14 @@ test("applies security headers and never serves alternate secret files", async (
       assert.equal(response.headers.get("x-content-type-options"), "nosniff");
       assert.match(response.headers.get("content-security-policy"), /script-src 'self'/);
       assert.match(response.headers.get("content-security-policy"), /frame-ancestors 'none'/);
+      assert.doesNotMatch(response.headers.get("content-security-policy"), /img-src[^;]*data:/);
       assert.equal(response.headers.get("referrer-policy"), "no-referrer");
       assert.equal(response.headers.get("permissions-policy"), "camera=(), microphone=(), geolocation=()");
+      assert.equal(response.headers.get("cross-origin-opener-policy"), "same-origin");
+      assert.equal(response.headers.get("cross-origin-resource-policy"), "same-origin");
+      assert.equal(response.headers.get("origin-agent-cluster"), "?1");
+      assert.equal(response.headers.get("x-dns-prefetch-control"), "off");
+      assert.equal(response.headers.get("x-permitted-cross-domain-policies"), "none");
       await response.text();
     }
   });
@@ -313,7 +319,7 @@ test("enables HSTS only when configured for an HTTPS deployment", async () => {
     const response = await fetch(origin);
     assert.equal(
       response.headers.get("strict-transport-security"),
-      "max-age=31536000",
+      "max-age=31536000; includeSubDomains",
     );
   });
 
@@ -321,6 +327,34 @@ test("enables HSTS only when configured for an HTTPS deployment", async () => {
     const response = await fetch(origin);
     assert.equal(response.headers.get("strict-transport-security"), null);
   });
+});
+
+test("forces HSTS in production and rejects unsafe authentication values", async () => {
+  const previous = process.env.NODE_ENV;
+  process.env.NODE_ENV = "production";
+  try {
+    await withServer({
+      authUser: "owner", authPassword: "test-password", enableHsts: false,
+    }, async (origin) => {
+      const response = await fetch(origin, {
+        headers: { Authorization: `Basic ${Buffer.from("owner:test-password").toString("base64")}` },
+      });
+      assert.equal(
+        response.headers.get("strict-transport-security"),
+        "max-age=31536000; includeSubDomains",
+      );
+    });
+  } finally {
+    if (previous === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previous;
+  }
+
+  for (const value of ["x\u0000y", "x".repeat(257)]) {
+    assert.throws(
+      () => createServer({ authUser: "owner", authPassword: value }),
+      /must be at most 256 characters without control characters/,
+    );
+  }
 });
 
 test("serves the search page without making provider requests", async () => {
